@@ -92,6 +92,37 @@ def AdaIn(content_feat, style_feat):
     It's the official implementation from the researchers who first proposed it
 '''
 
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, embed_dim=512, num_heads=8):
+        super(CrossAttentionBlock, self).__init__()
+        
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, content_feat, style_feat):
+        B, C, H, W = content_feat.size()
+        _, _, H_s, W_s = style_feat.size()
+        
+        # Content becomes our Query (Q)
+        query = content_feat.view(B, C, -1).permute(0, 2, 1) 
+        
+        # Style becomes our Keys (K) and Values (V)
+        key_value = style_feat.view(B, C, -1).permute(0, 2, 1) 
+        
+        # Apply Multi-Head Attention
+        # Output: (B, H*W, C)
+        attn_output, _ = self.attention(query, key_value, key_value)
+        
+        # Reshape back to image format: (B, H*W, C) -> (B, C, H*W) -> (B, C, H, W)
+        attn_output = attn_output.permute(0, 2, 1).view(B, C, H, W)
+        
+        # Residual connection (learnable)
+        # We start with gamma=0 so the model initially behaves just like the content,
+        # then smoothly learns to apply the attended style.
+        out = content_feat + self.gamma * attn_output
+        
+        return out
+    
 
 class BasicConv(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True, bn=False, bias=False):
@@ -327,12 +358,16 @@ class DeepDecoder(nn.Module):
     
 # Put the models together into a single model
 class StyleTransferModel(nn.Module):
-    def __init__(self, alpha=1.0, standardize_encoder_inputs=True, DeepDecoderTrue=False):
+    def __init__(self, alpha=1.0, standardize_encoder_inputs=True, DeepDecoderTrue=False, UseAttention=False):
         super(StyleTransferModel, self).__init__()
 
         self.encoder = Encoder().eval()
         self.cbam = CBAM(512)
         self.decoder = DeepDecoder() if DeepDecoderTrue else Decoder()
+
+
+        if UseAttention:
+            self.cross_attention = CrossAttentionBlock(embed_dim=512, num_heads=8)
 
         #alpha can be altered to adjust style application strength post training (0-1)
         self.alpha = alpha
@@ -341,6 +376,8 @@ class StyleTransferModel(nn.Module):
         if standardize_encoder_inputs:
             self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
             self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        self.UseAttention = UseAttention
 
 
     # Process the content and style images
@@ -363,6 +400,10 @@ class StyleTransferModel(nn.Module):
 
         # Skip connection
         attention_boosted_4_1 = content_feat4_1+attention4_1
+
+        if (self.UseAttention):
+            # Apply cross-attention to fuse style information
+            attention_boosted_4_1 = self.cross_attention(attention_boosted_4_1, style_feat4_1)
 
         # Perform adaptive instance normalization with to fuse style into content
         fused_feat4_1 = AdaIn(attention_boosted_4_1,style_feat4_1)

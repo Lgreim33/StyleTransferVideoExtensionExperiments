@@ -15,7 +15,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from models import StyleTransferModel, PatchGAN, StyleTransferLoss, gradient_penalty
-
+import random
+from pytorch_msssim import ssim
+import copy 
 
 
 
@@ -110,7 +112,7 @@ def setup_s3_data(bucket_name):
     return data_dir
 
 
-def save_and_upload_results(args, generator, discriminator, g_losses, d_losses, val_losses, s3_client):
+def save_and_upload_results(args, generator, discriminator, test_metrics, grid_tuple, g_losses, d_losses, val_losses, s3_client):
     """Saves the weights, metadata, convergence JSON, and a PNG graph, then pushes to S3."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = "/workspace/output"
@@ -143,6 +145,11 @@ def save_and_upload_results(args, generator, discriminator, g_losses, d_losses, 
         f.write(f"Final G Loss: {g_losses[-1] if g_losses else 'N/A':.4f}\n")
         f.write(f"Final D Loss: {d_losses[-1] if d_losses else 'N/A':.4f}\n")
         f.write(f"Best Val Loss: {min(val_losses) if val_losses else 'N/A'}\n")
+        f.write("--- Test Metrics ---\n")
+        f.write(f"Avg SSIM: {test_metrics['ssim']:.4f}\n")
+        f.write(f"Avg PSNR: {test_metrics['psnr']:.4f} dB\n")
+        f.write(f"Avg MSE:  {test_metrics['mse']:.6f}\n")
+        f.write(f"Avg Inference Time: {test_metrics['time']:.4f} sec\n")
 
     # Save JSON Array
     json_filename = f"{args.run_name}_{timestamp}_convergence.json"
@@ -303,11 +310,101 @@ def train_PatchGAN_image(
 
             if avg_val < min_val_loss:
                 min_val_loss = avg_val
+                best_weights = copy.deepcopy(generator.state_dict())
                 
             generator.train()
 
+
+    if 'best_weights' in locals():
+        generator.load_state_dict(best_weights)
+        print("Loaded best validation weights for testing.")
+
     print("Training Complete!")
     return G_losses, D_losses, val_loss_history
+
+
+class RandomSampleDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def selectRandomImages(dataset, num_samples=5):
+    indices = random.sample(range(len(dataset)), num_samples)
+    return [dataset[idx] for idx in indices]
+
+
+# Testing Functions
+
+def test_ssim_mse_time(styleTransferModel, loader, device):
+    total_ssim, mse_full, total_PSNR, total_time = 0, 0, 0, 0
+    length = len(loader)
+
+    print("\nRunning Strict Test Set Evaluation...")
+    with torch.no_grad():
+        for i, (content, style) in enumerate(loader):
+            content, style = content.to(device), style.to(device)
+            
+            time_now = time.time()
+            generated_image, _, _ = styleTransferModel(content, style)
+            total_time += time.time() - time_now
+
+            total_ssim += ssim(generated_image, content, data_range=1.0, size_average=True).item()
+            mse_full += F.mse_loss(generated_image, content, reduction='mean').item()
+            total_PSNR += 10 * torch.log10(1.0 / F.mse_loss(generated_image, content)).item()
+
+    return total_ssim / length, total_PSNR / length, mse_full / length, total_time / length
+
+def generate_test_grid(generator, random_loader, device, out_dir, timestamp, run_name):
+    content_images, style_images, original_content, original_style = [], [], [], []
+
+    for content_tensor, style_tensor in random_loader:
+        content_images.append(content_tensor)
+        style_images.append(style_tensor)
+        original_content.append(np.array(transforms.ToPILImage()(content_tensor[0])))
+        original_style.append(np.array(transforms.ToPILImage()(style_tensor[0])))
+
+    grid_size = len(content_images)
+    num_styles = len(style_images)
+    grid_images = [[None for _ in range(num_styles)] for _ in range(grid_size)]
+
+    print("Generating Combination Grid...")
+    with torch.no_grad():
+        for i, content_tensor in enumerate(content_images):
+            for j, style_tensor in enumerate(style_images):
+                generated_image, _, _ = generator(content_tensor.to(device), style_tensor.to(device))
+                stylized_image = transforms.ToPILImage()(generated_image.squeeze(0).cpu().clamp(0, 1))
+                grid_images[i][j] = np.array(stylized_image)
+
+    fig, axes = plt.subplots(grid_size + 1, num_styles + 1, figsize=(20, 20))
+    for j, img in enumerate(original_style):
+        axes[0, j + 1].imshow(img)
+        axes[0, j + 1].axis('off')
+        axes[0, j + 1].set_title(f"Style {j+1}", fontsize=8)
+
+    for i, img in enumerate(original_content):
+        axes[i + 1, 0].imshow(img)
+        axes[i + 1, 0].axis('off')
+        axes[i + 1, 0].set_ylabel(f"Content {i+1}", fontsize=8, rotation=90)
+
+    for i, row in enumerate(grid_images):
+        for j, img in enumerate(row):
+            axes[i + 1, j + 1].imshow(img)
+            axes[i + 1, j + 1].axis('off')
+
+    axes[0,0].axis("off")
+    plt.tight_layout()
+    
+    grid_filename = f"{run_name}_{timestamp}_subjective_grid.png"
+    grid_path = os.path.join(out_dir, grid_filename)
+    plt.savefig(grid_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return grid_path, grid_filename
+
+
 
 
 if __name__ == "__main__":
@@ -321,14 +418,19 @@ if __name__ == "__main__":
     coco_path = os.path.join(data_dir, "unlabeled2017")
     wikiart_path = os.path.join(data_dir, "wikiart")
     dataset = StyleContentDataset(coco_path, wikiart_path)
-    train_dataset, validation_dataset, _ = random_split(dataset, [0.8, 0.1, 0.1])
+    train_dataset, validation_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(validation_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True)
-    
+
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    random_samples = selectRandomImages(test_dataset, num_samples=5)
+    random_loader = DataLoader(RandomSampleDataset(random_samples), batch_size=1, shuffle=False)
+
     # Initialize Models
     generator = StyleTransferModel(DeepDecoderTrue=True, standardize_encoder_inputs=True, UseAttention=True).to(device)
     discriminator = PatchGAN().to(device)
+
     
     # Freeze Encoder in Generator
     for param in generator.encoder.model.parameters():
@@ -351,12 +453,24 @@ if __name__ == "__main__":
         generator, discriminator, criterion, train_loader, val_loader, 
         optimizer_G, optimizer_D, scheduler_G, device, args
     )
+
+
+    generator.eval()
     
+
+    # Generate the test metrics
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = "/workspace/output"
+    os.makedirs(out_dir, exist_ok=True)
+    grid_tuple = generate_test_grid(generator, random_loader, device, out_dir, timestamp, args.run_name)
+    ssim_score, psnr, mse, inf_time = test_ssim_mse_time(generator, test_loader, device)
+    test_metrics = {'ssim': ssim_score, 'psnr': psnr, 'mse': mse, 'time': inf_time}
+
     # Save and Upload
     s3_client = boto3.client('s3', 
                       endpoint_url=os.environ.get("S3_ENDPOINT"),
                       aws_access_key_id=os.environ.get("S3_ACCESS_KEY"),
                       aws_secret_access_key=os.environ.get("S3_SECRET_KEY"))
     
-    save_and_upload_results(args, generator, discriminator, g_losses, d_losses, val_losses, s3_client)
+    save_and_upload_results(args, generator, discriminator, test_metrics, grid_tuple, g_losses, d_losses, val_losses, s3_client)
     print("Job complete!")
